@@ -13,7 +13,7 @@ int main(int argc, char* argv[]){
     }
 
     int pid, n, i = 0;
-    char buf, arg[1024]
+    char buf, arg[1024];
     char *args[50];
 
     for(int i = 1; i < argc; ++i) args[i-1] = argv[i];
