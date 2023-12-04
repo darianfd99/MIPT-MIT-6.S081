@@ -121,6 +121,16 @@ found:
     return 0;
   }
 
+  p->kpagetable = proc_kpagetable(p);
+  if(p->kpagetable == 0){
+      freeproc(p);
+      release(&p->lock);
+      return 0;
+  }
+
+  if(mappages(p->kpagetable, p->kstack , PGSIZE, kvmpa(p->kstack), PTE_R | PTE_W) != 0)
+      panic("kstack");
+
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
@@ -142,6 +152,9 @@ freeproc(struct proc *p)
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
+  if(p->kpagetable)
+      proc_freekpagetable(p->kpagetable);
+  p->kpagetable = 0;
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;
@@ -183,6 +196,52 @@ proc_pagetable(struct proc *p)
   }
 
   return pagetable;
+}
+
+// Create a copy of kernel page table for a given process
+pagetable_t proc_kpagetable(struct proc *p){
+    extern char etext[];
+    pagetable_t pagetable;
+
+    // An empty page table.
+    pagetable = uvmcreate();
+    if(pagetable == 0)
+        return 0;
+
+    // uart registers
+    if(mappages(pagetable, UART0, PGSIZE, UART0, PTE_R | PTE_W) != 0)
+        panic("UART0");
+
+    // virtio mmio disk interface
+    if(mappages(pagetable, VIRTIO0, PGSIZE, VIRTIO0, PTE_R | PTE_W) != 0)
+        panic("VIRTIO0");
+
+    // CLINT
+    if(mappages(pagetable, CLINT,  0x10000, CLINT, PTE_R | PTE_W) != 0)
+        panic("CLINT");
+
+    // PLIC
+    if(mappages(pagetable, PLIC, 0x400000, PLIC, PTE_R | PTE_W) != 0)
+        panic("PLIC");
+
+    // map kernel text executable and read-only.
+    if(mappages(pagetable, KERNBASE, (uint64)etext-KERNBASE, KERNBASE, PTE_R | PTE_X) != 0)
+        panic("KERNELBASE");
+
+    // map kernel data and the physical RAM we'll make use of.
+    if(mappages(pagetable, (uint64)etext, PHYSTOP-(uint64)etext, (uint64)etext, PTE_R | PTE_W) != 0)
+        panic("etext");
+
+    //TRAPFRAME
+    if(mappages(pagetable, TRAPFRAME, PGSIZE, (uint64)(p->trapframe), PTE_R | PTE_W) < 0)
+        panic("trapframe");
+
+    // map the trampoline for trap entry/exit to
+    // the highest virtual address in the kernel.
+    if(mappages(pagetable, TRAMPOLINE, PGSIZE, (uint64)trampoline, PTE_R | PTE_X) != 0)
+        panic("TRAMPOLINE");
+
+    return pagetable;
 }
 
 // Free a process's page table, and free the
@@ -473,6 +532,10 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+
+        w_satp(MAKE_SATP(p->kpagetable));
+        sfence_vma();
+
         swtch(&c->context, &p->context);
 
         // Process is done running for now.
@@ -480,6 +543,7 @@ scheduler(void)
         c->proc = 0;
 
         found = 1;
+        kvminithart();
       }
       release(&p->lock);
     }
@@ -696,4 +760,17 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+
+void proc_freekpagetable(pagetable_t pagetable){
+    for(int i=0; i < 512; ++i){
+        pte_t pte = pagetable[i];
+        if (PTE_FLAGS(pte) == PTE_V){
+            proc_freekpagetable((pagetable_t)PTE2PA(pte));
+            pagetable[i] = 0;
+        }else if (pte & PTE_V){
+            pagetable[i] = 0;
+        }
+    }
+    kfree(pagetable);
 }
